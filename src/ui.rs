@@ -1,5 +1,7 @@
-use crate::recorder::{Recorder, RecorderState, RecordingRegion};
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2, ViewportCommand};
+use crate::recorder::{spawn_global_f9_listener, Recorder, RecorderState, RecordingRegion};
+use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2, ViewportCommand};
+use std::sync::mpsc::Receiver;
+use xcap::Monitor;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SelectedMode {
@@ -14,8 +16,10 @@ pub struct RecMiApp {
     is_selecting_region: bool,
     drag_start: Option<Pos2>,
     drag_current: Option<Pos2>,
+    selection_texture: Option<TextureHandle>,
     error_msg: Option<String>,
     was_recording: bool,
+    f9_receiver: Receiver<()>,
 }
 
 impl RecMiApp {
@@ -27,25 +31,50 @@ impl RecMiApp {
             is_selecting_region: false,
             drag_start: None,
             drag_current: None,
+            selection_texture: None,
             error_msg: None,
             was_recording: false,
+            f9_receiver: spawn_global_f9_listener(),
         }
     }
 
     fn start_region_selection(&mut self, ctx: &egui::Context) {
+        // Capture desktop snapshot for instant screen-freeze overlay
+        if let Ok(monitors) = Monitor::all() {
+            let primary = monitors
+                .into_iter()
+                .find(|m| m.is_primary().unwrap_or(false))
+                .or_else(|| Monitor::all().ok()?.into_iter().next());
+
+            if let Some(mon) = primary {
+                if let Ok(img) = mon.capture_image() {
+                    let size = [img.width() as usize, img.height() as usize];
+                    let color_img = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+                    self.selection_texture = Some(ctx.load_texture(
+                        "freeze_bg",
+                        color_img,
+                        TextureOptions::LINEAR,
+                    ));
+                }
+            }
+        }
+
         self.is_selecting_region = true;
         self.drag_start = None;
         self.drag_current = None;
         ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+        ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
     }
 
     fn finish_region_selection(&mut self, ctx: &egui::Context) {
         if let (Some(start), Some(current)) = (self.drag_start, self.drag_current) {
-            let min_x = start.x.min(current.x).max(0.0) as u32;
-            let min_y = start.y.min(current.y).max(0.0) as u32;
-            let max_x = start.x.max(current.x).max(0.0) as u32;
-            let max_y = start.y.max(current.y).max(0.0) as u32;
+            let ppp = ctx.pixels_per_point();
+
+            let min_x = (start.x.min(current.x).max(0.0) * ppp).round() as u32;
+            let min_y = (start.y.min(current.y).max(0.0) * ppp).round() as u32;
+            let max_x = (start.x.max(current.x).max(0.0) * ppp).round() as u32;
+            let max_y = (start.y.max(current.y).max(0.0) * ppp).round() as u32;
 
             let w = max_x.saturating_sub(min_x);
             let h = max_y.saturating_sub(min_y);
@@ -59,7 +88,9 @@ impl RecMiApp {
         self.is_selecting_region = false;
         self.drag_start = None;
         self.drag_current = None;
+        self.selection_texture = None;
         ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+        ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(340.0, 240.0)));
     }
 
@@ -67,24 +98,51 @@ impl RecMiApp {
         self.is_selecting_region = false;
         self.drag_start = None;
         self.drag_current = None;
+        self.selection_texture = None;
         ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+        ctx.send_viewport_cmd(ViewportCommand::Decorations(true));
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(340.0, 240.0)));
+    }
+
+    fn toggle_recording(&mut self) {
+        if self.recorder.is_recording() {
+            self.recorder.stop();
+        } else {
+            self.error_msg = None;
+            let target_region = if self.mode == SelectedMode::Region {
+                self.region
+            } else {
+                None
+            };
+            if let Err(err) = self.recorder.start(target_region) {
+                self.error_msg = Some(err);
+            }
+        }
     }
 }
 
 impl eframe::App for RecMiApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- 1. REGION SELECTION OVERLAY ---
+        // --- 1. RECEIVE WIN32 SYSTEM-WIDE F9 HOTKEY MESSAGES ---
+        while let Ok(()) = self.f9_receiver.try_recv() {
+            self.toggle_recording();
+        }
+
+        // --- 2. SCREEN-FREEZE REGION SELECTION OVERLAY ---
         if self.is_selecting_region {
-            // Cancel on Escape
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.cancel_region_selection(ctx);
                 return;
             }
 
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(Color32::from_black_alpha(80)))
+                .frame(egui::Frame::none().fill(Color32::BLACK))
                 .show(ctx, |ui| {
+                    let screen_rect = ui.available_rect_before_wrap();
                     let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::drag());
 
                     if response.drag_started() {
@@ -105,25 +163,57 @@ impl eframe::App for RecMiApp {
                         return;
                     }
 
-                    // Render Selection Box & Dimensions Badge
+                    // Render Captured Desktop Background Image
+                    if let Some(ref texture) = self.selection_texture {
+                        painter.image(
+                            texture.id(),
+                            screen_rect,
+                            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
+
+                    let dark_tint = Color32::from_black_alpha(90);
+
+                    // Render Cutout & Dimmed Overlay
                     if let (Some(start), Some(current)) = (self.drag_start, self.drag_current) {
-                        let rect = Rect::from_two_pos(start, current);
-                        
-                        // Clear cutout border
+                        let sel_rect = Rect::from_two_pos(start, current);
+
+                        // Mask 4 outer rectangles around selection box
+                        let top_rect = Rect::from_min_max(screen_rect.min, Pos2::new(screen_rect.max.x, sel_rect.min.y));
+                        painter.rect_filled(top_rect, 0.0, dark_tint);
+
+                        let bot_rect = Rect::from_min_max(Pos2::new(screen_rect.min.x, sel_rect.max.y), screen_rect.max);
+                        painter.rect_filled(bot_rect, 0.0, dark_tint);
+
+                        let left_rect = Rect::from_min_max(
+                            Pos2::new(screen_rect.min.x, sel_rect.min.y),
+                            Pos2::new(sel_rect.min.x, sel_rect.max.y),
+                        );
+                        painter.rect_filled(left_rect, 0.0, dark_tint);
+
+                        let right_rect = Rect::from_min_max(
+                            Pos2::new(sel_rect.max.x, sel_rect.min.y),
+                            Pos2::new(screen_rect.max.x, sel_rect.max.y),
+                        );
+                        painter.rect_filled(right_rect, 0.0, dark_tint);
+
+                        // Red Selection Border Line
                         painter.rect_stroke(
-                            rect,
-                            2.0,
+                            sel_rect,
+                            0.0,
                             Stroke::new(2.5f32, Color32::from_rgb(229, 9, 20)),
                         );
 
                         // Dimensions Label Badge
-                        let w = (rect.width().abs() as u32) & !1;
-                        let h = (rect.height().abs() as u32) & !1;
+                        let ppp = ctx.pixels_per_point();
+                        let w = ((sel_rect.width().abs() * ppp).round() as u32) & !1;
+                        let h = ((sel_rect.height().abs() * ppp).round() as u32) & !1;
                         let badge_text = format!(" {} × {} px ", w, h);
 
                         let badge_pos = Pos2::new(
-                            rect.left().max(10.0),
-                            (rect.top() - 28.0).max(10.0),
+                            sel_rect.left().max(10.0),
+                            (sel_rect.top() - 28.0).max(10.0),
                         );
 
                         painter.text(
@@ -134,9 +224,10 @@ impl eframe::App for RecMiApp {
                             Color32::WHITE,
                         );
                     } else {
-                        // Instruction overlay when not dragging yet
+                        // Dim screen before drag starts
+                        painter.rect_filled(screen_rect, 0.0, dark_tint);
                         painter.text(
-                            ui.available_rect_before_wrap().center(),
+                            screen_rect.center(),
                             Align2::CENTER_CENTER,
                             "Click and drag to select recording area\nPress Esc to cancel",
                             FontId::proportional(20.0),
@@ -149,14 +240,17 @@ impl eframe::App for RecMiApp {
             return;
         }
 
-        // --- 2. MAIN APPLICATION LIFECYCLE ---
+        // --- 3. MAIN APPLICATION & RECORDING LIFECYCLE ---
         let is_recording = self.recorder.is_recording();
 
         if is_recording && !self.was_recording {
+            // Auto-minimize recorder window when recording starts in ANY mode
             ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
         } else if !is_recording && self.was_recording {
+            // Restore window when recording stops
             ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(ViewportCommand::Focus);
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(340.0, 240.0)));
         }
         self.was_recording = is_recording;
 
@@ -164,6 +258,7 @@ impl eframe::App for RecMiApp {
             ctx.request_repaint();
         }
 
+        // Standard App Panel
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(10.0);
@@ -181,9 +276,7 @@ impl eframe::App for RecMiApp {
                 if is_recording {
                     // --- RECORDING STATE ---
                     let elapsed_secs = self.recorder.elapsed_secs();
-                    let mins = elapsed_secs / 60;
-                    let secs = elapsed_secs % 60;
-                    let time_str = format!("{:02}:{:02}", mins, secs);
+                    let time_str = format!("{:02}:{:02}", elapsed_secs / 60, elapsed_secs % 60);
 
                     ui.horizontal(|ui| {
                         ui.add_space((ui.available_width() - 110.0) / 2.0);
@@ -203,7 +296,7 @@ impl eframe::App for RecMiApp {
                     ui.add_space(14.0);
 
                     let stop_btn = egui::Button::new(
-                        RichText::new("STOP")
+                        RichText::new("STOP (F9)")
                             .font(FontId::proportional(16.0))
                             .strong()
                             .color(Color32::WHITE),
@@ -216,7 +309,6 @@ impl eframe::App for RecMiApp {
                     }
                 } else {
                     // --- IDLE STATE ---
-                    // Mode Switcher (Fullscreen / Region)
                     ui.horizontal(|ui| {
                         ui.add_space((ui.available_width() - 230.0) / 2.0);
 
@@ -250,7 +342,6 @@ impl eframe::App for RecMiApp {
 
                     ui.add_space(10.0);
 
-                    // If in Region mode, show Select Area button / region dimensions
                     if self.mode == SelectedMode::Region {
                         if let Some(r) = self.region {
                             ui.horizontal(|ui| {
@@ -272,9 +363,8 @@ impl eframe::App for RecMiApp {
                         ui.add_space(10.0);
                     }
 
-                    // Main RECORD Button
                     let record_btn = egui::Button::new(
-                        RichText::new("● RECORD")
+                        RichText::new("● RECORD (F9)")
                             .font(FontId::proportional(16.0))
                             .strong()
                             .color(Color32::WHITE),
@@ -283,21 +373,11 @@ impl eframe::App for RecMiApp {
                     .min_size(Vec2::new(180.0, 44.0));
 
                     if ui.add(record_btn).clicked() {
-                        self.error_msg = None;
-                        let target_region = if self.mode == SelectedMode::Region {
-                            self.region
-                        } else {
-                            None
-                        };
-
-                        if let Err(err) = self.recorder.start(target_region) {
-                            self.error_msg = Some(err);
-                        }
+                        self.toggle_recording();
                     }
 
                     ui.add_space(10.0);
 
-                    // Subtitle / Specs
                     let spec_text = match (self.mode, self.region) {
                         (SelectedMode::Region, Some(r)) => format!("30 FPS  ·  MP4  ·  {}×{}", r.width, r.height),
                         _ => "30 FPS  ·  MP4  ·  Fullscreen".to_string(),
@@ -312,7 +392,6 @@ impl eframe::App for RecMiApp {
 
                 ui.add_space(10.0);
 
-                // Notifications / Messages
                 if let Some(err) = &self.error_msg {
                     ui.label(
                         RichText::new(err)

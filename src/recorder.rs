@@ -19,7 +19,6 @@ pub struct RecordingRegion {
 
 impl RecordingRegion {
     pub fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
-        // Ensure even dimensions for FFmpeg H.264 (yuv420p)
         let mut w = width & !1;
         let mut h = height & !1;
         if w < 2 { w = 2; }
@@ -117,7 +116,6 @@ impl Recorder {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let is_running = Arc::clone(&stop_flag);
 
-        // Bounded channel (max 60 frames buffered in RAM)
         let (tx, rx): (SyncSender<RgbaImage>, Receiver<RgbaImage>) = mpsc::sync_channel(60);
 
         // 4. Spawn Encoder Thread
@@ -224,4 +222,49 @@ impl Recorder {
             };
         }
     }
+}
+
+// Spawns native Win32 WM_HOTKEY thread to listen for F9 system-wide
+pub fn spawn_global_f9_listener() -> Receiver<()> {
+    let (tx, rx) = mpsc::channel();
+
+    #[cfg(target_os = "windows")]
+    thread::spawn(move || {
+        #[link(name = "user32")]
+        extern "system" {
+            fn RegisterHotKey(hWnd: *mut std::ffi::c_void, id: i32, fsModifiers: u32, vk: u32) -> i32;
+            fn GetMessageW(lpMsg: *mut Msg, hWnd: *mut std::ffi::c_void, wMsgFilterMin: u32, wMsgFilterMax: u32) -> i32;
+            fn UnregisterHotKey(hWnd: *mut std::ffi::c_void, id: i32) -> i32;
+        }
+
+        #[repr(C)]
+        struct Point { x: i32, y: i32 }
+        #[repr(C)]
+        struct Msg {
+            hwnd: *mut std::ffi::c_void,
+            message: u32,
+            wparam: usize,
+            lparam: isize,
+            time: u32,
+            pt: Point,
+        }
+
+        const WM_HOTKEY: u32 = 0x0312;
+        const MOD_NOREPEAT: u32 = 0x4000;
+        const VK_F9: u32 = 0x78;
+
+        unsafe {
+            if RegisterHotKey(std::ptr::null_mut(), 1, MOD_NOREPEAT, VK_F9) != 0 {
+                let mut msg: Msg = std::mem::zeroed();
+                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                    if msg.message == WM_HOTKEY {
+                        let _ = tx.send(());
+                    }
+                }
+                UnregisterHotKey(std::ptr::null_mut(), 1);
+            }
+        }
+    });
+
+    rx
 }
