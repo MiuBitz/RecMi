@@ -1,6 +1,6 @@
 use xcap::Monitor;
 use chrono::Local;
-use image::RgbaImage;
+use image::{imageops, RgbaImage};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,12 +9,32 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RecordingRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl RecordingRegion {
+    pub fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        // Ensure even dimensions for FFmpeg H.264 (yuv420p)
+        let mut w = width & !1;
+        let mut h = height & !1;
+        if w < 2 { w = 2; }
+        if h < 2 { h = 2; }
+        Self { x, y, width: w, height: h }
+    }
+}
+
 #[allow(dead_code)]
 pub enum RecorderState {
     Idle,
     Recording {
         start_time: Instant,
         output_filename: String,
+        region: Option<RecordingRegion>,
     },
     Finished {
         saved_path: String,
@@ -52,12 +72,12 @@ impl Recorder {
         &self.state
     }
 
-    pub fn start(&mut self) -> Result<(), String> {
+    pub fn start(&mut self, region: Option<RecordingRegion>) -> Result<(), String> {
         if self.is_recording() {
             return Ok(());
         }
 
-        // 1. Detect target monitor resolution
+        // 1. Detect target monitor
         let monitors = Monitor::all().map_err(|e| format!("Failed to list monitors: {}", e))?;
         if monitors.is_empty() {
             return Err("No active monitors found".into());
@@ -69,8 +89,25 @@ impl Recorder {
             .or_else(|| Monitor::all().ok()?.into_iter().next())
             .ok_or("Primary monitor unavailable")?;
 
-        let width = primary_mon.width().map_err(|e| e.to_string())?;
-        let height = primary_mon.height().map_err(|e| e.to_string())?;
+        let mon_w = primary_mon.width().map_err(|e| e.to_string())?;
+        let mon_h = primary_mon.height().map_err(|e| e.to_string())?;
+
+        // Determine final recording dimensions
+        let (rec_w, rec_h, crop_info) = if let Some(r) = region {
+            let clamped_x = r.x.min(mon_w.saturating_sub(2));
+            let clamped_y = r.y.min(mon_h.saturating_sub(2));
+            let clamped_w = (r.width & !1).clamp(2, mon_w - clamped_x);
+            let clamped_h = (r.height & !1).clamp(2, mon_h - clamped_y);
+            let final_region = RecordingRegion {
+                x: clamped_x,
+                y: clamped_y,
+                width: clamped_w,
+                height: clamped_h,
+            };
+            (clamped_w, clamped_h, Some(final_region))
+        } else {
+            (mon_w & !1, mon_h & !1, None)
+        };
 
         // 2. Generate filename
         let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
@@ -90,7 +127,7 @@ impl Recorder {
                 .args([
                     "-f", "rawvideo",
                     "-pixel_format", "rgba",
-                    "-video_size", &format!("{}x{}", width, height),
+                    "-video_size", &format!("{}x{}", rec_w, rec_h),
                     "-framerate", "30",
                     "-i", "pipe:0",
                     "-c:v", "libx264",
@@ -117,13 +154,12 @@ impl Recorder {
                         break;
                     }
                 }
-                // Pipe auto-closes when stdin drops
             }
 
             let _ = child.wait();
         });
 
-        // 5. Spawn Capture Thread (re-queries Monitor inside thread for thread safety)
+        // 5. Spawn Capture Thread
         let capture_handle = thread::spawn(move || {
             let monitors = match Monitor::all() {
                 Ok(m) => m,
@@ -144,9 +180,14 @@ impl Recorder {
             while !is_running.load(Ordering::Relaxed) {
                 let frame_start = Instant::now();
 
-                if let Ok(image) = monitor.capture_image() {
-                    // Send to encoder channel (drop frame if encoder lags)
-                    let _ = tx.try_send(image);
+                if let Ok(full_image) = monitor.capture_image() {
+                    let frame_to_send = if let Some(r) = crop_info {
+                        imageops::crop_imm(&full_image, r.x, r.y, r.width, r.height).to_image()
+                    } else {
+                        full_image
+                    };
+
+                    let _ = tx.try_send(frame_to_send);
                 }
 
                 let elapsed = frame_start.elapsed();
@@ -161,6 +202,7 @@ impl Recorder {
         self.state = RecorderState::Recording {
             start_time: Instant::now(),
             output_filename,
+            region: crop_info,
         };
 
         Ok(())
