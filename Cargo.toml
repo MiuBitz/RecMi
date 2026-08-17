@@ -1,0 +1,11 @@
+[package]
+name = "recmi"
+version = "0.1.0"
+edition = "2021"
+authors = ["RecMi Team"]
+description = "A minimal, distraction-free desktop screen recorder"
+
+[dependencies]
+xcap = "0.9"
+image = "0.25"
+chrono = "0.4"
