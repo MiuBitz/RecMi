@@ -2,3 +2,6 @@
 screenshot_test.png
 *.mp4
 *.png
+
+!icons/*.png
+/gen/

@@ -1,15 +1,20 @@
 [package]
 name = "recmi"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
-authors = ["RecMi Team"]
-description = "A minimal, distraction-free desktop screen recorder"
+description = "A minimal desktop screen recorder"
 
 [dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-global-shortcut = "2"
 xcap = "0.9"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["png"] }
 chrono = "0.4"
-eframe = "0.28"
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"
 
 [build-dependencies]
-winres = "0.1"
+tauri-build = "2"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = '0.25'

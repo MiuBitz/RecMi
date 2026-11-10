@@ -1,3 +1,5 @@
+NOTE: This is the original egui-era plan. The current implementation uses Rust + Tauri 2, native FFmpeg desktop capture, region selection, and F9 control. See README.md for current build and usage instructions.
+
 # RecMi — Project Plan
 
 ## 1. Project Overview

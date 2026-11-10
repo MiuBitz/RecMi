@@ -1,0 +1,14 @@
+{
+  "identifier": "main",
+  "windows": [
+    "main",
+    "selector",
+    "indicator"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-close"
+  ]
+}
